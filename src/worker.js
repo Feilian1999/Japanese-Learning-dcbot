@@ -1,4 +1,4 @@
-import { buildEmbed, parseManual, splitInput } from './card.js';
+import { buildCard, parseManual, splitInput } from './card.js';
 import { generateEntry } from './dictionary.js';
 import { recordEntry } from './history.js';
 
@@ -47,9 +47,9 @@ function editOriginal(env, interaction, payload) {
 
 async function generateAndReply(env, interaction, parts) {
   try {
-    const entry = await generateEntry(parts[0], parts[1]);
+    const entry = await generateEntry(parts[0], parts[1], env.AI);
     const history = await recordEntry(env, interaction, entry);
-    await editOriginal(env, interaction, { embeds: [buildEmbed(entry, interaction, history)] });
+    await editOriginal(env, interaction, buildCard(entry, interaction, history));
   } catch (err) {
     console.error(err);
     await editOriginal(env, interaction, {
@@ -68,7 +68,7 @@ async function handleAdd(env, ctx, interaction) {
     const history = await recordEntry(env, interaction, entry);
     return Response.json({
       type: ResponseType.CHANNEL_MESSAGE,
-      data: { embeds: [buildEmbed(entry, interaction, history)] },
+      data: buildCard(entry, interaction, history),
     });
   }
 

@@ -14,13 +14,9 @@ export function userOf(interaction) {
 }
 
 // 下指令的人：伺服器暱稱 > 顯示名稱 > 使用者名稱
-function authorOf(interaction) {
+function authorName(interaction) {
   const user = userOf(interaction);
-  const name = interaction.member?.nick ?? user.global_name ?? user.username;
-  const iconURL = user.avatar
-    ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png`
-    : `https://cdn.discordapp.com/embed/avatars/${(BigInt(user.id) >> 22n) % 6n}.png`;
-  return { name, iconURL };
+  return interaction.member?.nick ?? user.global_name ?? user.username;
 }
 
 // D1 的 CURRENT_TIMESTAMP 是 UTC（2026-10-15 06:36:27），轉成台灣日期
@@ -29,38 +25,49 @@ function formatTaipeiDate(utc) {
   return taipei.toISOString().slice(0, 10).replaceAll('-', '/');
 }
 
-function historyLine(history) {
+function historyText(history) {
   if (!history) return '';
   if (history.times === 1) return '🆕 第一次出現';
   return `🔁 第 ${history.times} 次出現（上次 ${formatTaipeiDate(history.lastAt)}）`;
 }
 
-export function buildEmbed(
-  { word, reading, meaning, english, tags, example, exampleTranslation },
+// https://docs.discord.com/developers/components/reference
+const IS_COMPONENTS_V2 = 1 << 15;
+const ComponentType = { TEXT_DISPLAY: 10, SEPARATOR: 14, CONTAINER: 17 };
+const text = (content) => ({ type: ComponentType.TEXT_DISPLAY, content });
+const divider = () => ({ type: ComponentType.SEPARATOR, divider: true, spacing: 2 });
+
+// 單字卡版面：單字放大當視覺焦點，讀音/等級/詞性同一行，意思與例句用分隔線分區
+export function buildCard(
+  { word, reading, meaning, english, tags = [], example, exampleTranslation },
   interaction,
   history,
 ) {
-  const author = authorOf(interaction);
-  const meaningText = [meaning || '（查無翻譯）', english && `-# ${english}`]
-    .filter(Boolean)
-    .join('\n');
+  // 等級、詞性用行內程式碼顯示成小標籤
+  const infoLine = [reading, ...tags.map((tag) => `\`${tag}\``)].join('　');
 
-  const embed = {
-    color: 0xe95464,
-    title: word,
-    description: [tags ? `**${reading}**　\`${tags}\`` : `**${reading}**`, historyLine(history)]
-      .filter(Boolean)
-      .join('\n'),
-    fields: [{ name: '📖 意思', value: meaningText }],
-    footer: { text: `由 ${author.name} 新增`, icon_url: author.iconURL },
-    timestamp: new Date().toISOString(),
-  };
+  const components = [
+    text(`# ${word}\n${infoLine}`),
+    divider(),
+    text([`**${meaning || '（查無翻譯）'}**`, english && `-# ${english}`].filter(Boolean).join('\n')),
+  ];
 
   if (example) {
-    // 例句中出現的單字加粗，方便閱讀
-    const highlighted = example.replaceAll(word, `**${word}**`);
-    const value = exampleTranslation ? `${highlighted}\n${exampleTranslation}` : highlighted;
-    embed.fields.push({ name: '✏️ 例句', value });
+    // 例句中出現的單字加粗加底線，方便閱讀
+    const highlighted = example.replaceAll(word, `__**${word}**__`);
+    components.push(
+      divider(),
+      text([highlighted, exampleTranslation && `-# ${exampleTranslation}`].filter(Boolean).join('\n')),
+    );
   }
-  return embed;
+
+  components.push(
+    divider(),
+    text(`-# ${[historyText(history), `由 ${authorName(interaction)} 新增`].filter(Boolean).join('・')}`),
+  );
+
+  return {
+    flags: IS_COMPONENTS_V2,
+    components: [{ type: ComponentType.CONTAINER, accent_color: 0xf6a19b, components }],
+  };
 }

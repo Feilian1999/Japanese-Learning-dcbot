@@ -6,3 +6,6 @@ compatibility_date = "2026-09-01"
 binding = "DB"
 database_name = "discord-japanese-bot"
 database_id = "a39bfc8d-6c36-4f3a-b146-9d1dfdc5c095"
+
+[ai]
+binding = "AI"
