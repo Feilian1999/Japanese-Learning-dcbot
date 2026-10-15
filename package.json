@@ -6,7 +6,8 @@
   "scripts": {
     "register": "node --env-file=.env scripts/register.js",
     "deploy": "wrangler deploy",
-    "dev": "wrangler dev"
+    "dev": "wrangler dev",
+    "build:jlpt": "node scripts/build-jlpt.js"
   },
   "keywords": [],
   "author": "",

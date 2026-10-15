@@ -39,22 +39,63 @@
 
 | 欄位 | 來源 |
 |---|---|
-| 讀音、JLPT 等級、詞性、英文解釋 | [Jisho](https://jisho.org)（JMdict 字典） |
+| 讀音、詞性、英文解釋 | [Jotoba](https://jotoba.de)（JMdict 字典） |
+| JLPT 等級 | 內建對照表，來自 [open-anki-jlpt-decks](https://github.com/jamsinclair/open-anki-jlpt-decks)（MIT），原始資料為 [Jonathan Waller 的 JLPT 單字表](https://www.tanos.co.uk/jlpt/)，N5～N1 約 8000 字 |
 | 中文意思 | [Cloudflare Workers AI](https://developers.cloudflare.com/workers-ai/)（Qwen3）參考字典的英文詞義整理；失敗時改用 Google 翻譯 / [MyMemory](https://mymemory.translated.net) |
-| 例句與例句翻譯 | [Tatoeba](https://tatoeba.org) 開放例句庫；沒有繁中翻譯時用機器翻譯 |
+| 例句 | 依序嘗試：[Tatoeba](https://tatoeba.org) 開放例句庫 → [Jotoba](https://jotoba.de) 例句（可找到動詞變化）→ [Massif](https://massif.la)（網路文章例句，收錄最廣） |
+| 例句翻譯 | Tatoeba 的真人繁中翻譯；沒有時由 Workers AI 翻譯（附上真人英文 / 簡中翻譯當參考），失敗時改用 Google 翻譯 → MyMemory |
 
-Workers AI 免費額度每天 10,000 Neurons，查一個字約 5 Neurons（每天約 2000 個字）。中文意思由 AI 整理，偶爾不夠精準，建議對照英文解釋。
+> 原本使用 [Jisho](https://jisho.org)，但從 Cloudflare Workers 連線一律回應 525，因此改用同樣以 JMdict 為資料來源的 Jotoba。Jotoba 不提供 JLPT 等級，所以改用內建的對照表，送假名寫法不同（控え室 / 控室）也對照得到。
 
-## 運作方式
+Workers AI 免費額度每天 10,000 Neurons，查一個字（中文意思＋例句翻譯）約 10 Neurons（每天約 1000 個字）。中文意思由 AI 整理，偶爾不夠精準，建議對照英文解釋。
+
+## 技術架構
 
 ```
-Discord ──(/add 指令)──▶ Cloudflare Worker ──▶ Jisho / Google 翻譯 / Tatoeba
-                               │
-                               ├──▶ Workers AI（整理中文意思）
-                               └──▶ D1 資料庫（記錄出現次數）
+你在 Discord 輸入 /add
+      ↓
+Discord ──呼叫──▶ Cloudflare Worker（workers.dev 網址）
+                     ├─▶ Jotoba（字典）
+                     ├─▶ Workers AI（中文意思）
+                     ├─▶ Tatoeba / Jotoba / Massif（例句）
+                     ├─▶ Google 翻譯（例句翻譯）
+                     └─▶ D1（記錄次數）
+      ↓
+單字卡出現在頻道
+
+你的電腦 ──(npm run deploy)──▶ Cloudflare
+你的電腦 ──(git push)──▶ GitHub
 ```
 
-機器人不使用常駐連線，而是由 Discord 在有人下指令時呼叫 Worker 的網址（[Interactions Endpoint](https://discord.com/developers/docs/interactions/receiving-and-responding)）。自動查詢需要幾秒，所以會先回覆「思考中」，查完再補上單字卡。
+機器人不使用常駐連線（Gateway），而是由 Discord 在有人下指令時呼叫 Worker 的網址（[Interactions Endpoint](https://discord.com/developers/docs/interactions/receiving-and-responding)）。因此可以放在免費、不休眠的 Cloudflare Workers 上，代價是機器人在成員列表會顯示離線（功能不受影響），也無法讀取一般訊息。
+
+每次 `/add` 的處理流程：
+
+1. 驗證請求的 Ed25519 簽章，確認來自 Discord
+2. 先回覆「思考中」，避免超過 Discord 的 3 秒回應限制
+3. 查 Jotoba 取得讀音、詞性、英文解釋
+4. 請 Workers AI 參考英文詞義整理中文意思
+5. 依序從 Tatoeba、Jotoba、Massif 找例句並翻譯
+6. 寫入 D1，計算這個字在伺服器中第幾次出現
+7. 把「思考中」替換成單字卡
+
+### 部署平台
+
+| 服務 | 用途 | 免費額度 |
+|---|---|---|
+| [Discord Developer Portal](https://discord.com/developers/applications) | 建立機器人、取得 Token 與金鑰、設定 Interactions Endpoint、產生邀請網址 | 免費 |
+| [Cloudflare Workers](https://developers.cloudflare.com/workers/) | 機器人本體，接收 `/add` 並回覆單字卡 | 每天 10 萬次請求 |
+| workers.dev | Cloudflare 提供的免費網址，讓 Discord 呼叫 Worker | 免費 |
+| [Cloudflare D1](https://developers.cloudflare.com/d1/) | 資料庫，記錄查過的單字與次數 | 每天 10 萬次寫入 |
+| [Cloudflare Workers AI](https://developers.cloudflare.com/workers-ai/) | 以 Qwen3 整理中文意思、翻譯例句 | 每天 10,000 Neurons（約 1000 個字） |
+| [GitHub](https://github.com) | 保存程式碼與修改紀錄 | 免費 |
+
+### 開發工具
+
+| 工具 | 用途 |
+|---|---|
+| [Wrangler](https://developers.cloudflare.com/workers/wrangler/) | Cloudflare 的指令工具：部署、設定 secret、建立資料庫、查看即時 log |
+| Node.js / npm | 執行 Wrangler 與註冊指令的腳本 |
 
 ## 部署
 
@@ -123,6 +164,7 @@ npm run register
 |---|---|
 | `npm run deploy` | 修改程式後重新部署 |
 | `npm run register` | 新增或修改指令定義後重新註冊 |
+| `npm run build:jlpt` | 重新下載 JLPT 單字表並產生 `src/jlpt-data.js` |
 | `npx wrangler tail` | 即時查看線上的 log 與錯誤 |
 | `npm run dev` | 本機啟動 Worker（需要 `.dev.vars` 設定 `DISCORD_PUBLIC_KEY`、`DISCORD_APPLICATION_ID`） |
 
@@ -136,8 +178,11 @@ src/
   card.js         解析輸入、排版單字卡
   dictionary.js   查字典、翻譯、找例句
   history.js      記錄並統計單字出現次數
+  jlpt.js         查詢 JLPT 等級
+  jlpt-data.js    JLPT 對照表（由 scripts/build-jlpt.js 產生）
 scripts/
   register.js     向 Discord 註冊 /add 指令
+  build-jlpt.js   產生 JLPT 對照表
 migrations/       D1 資料表結構
 wrangler.toml     Cloudflare Worker 與資料庫設定
 ```

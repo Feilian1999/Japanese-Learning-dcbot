@@ -1,3 +1,5 @@
+import { jlptLevel } from './jlpt.js';
+
 // 支援半形空白、全形空白與 tab 分隔
 export function splitInput(text) {
   return text.trim().split(/[\s　]+/).filter(Boolean);
@@ -6,7 +8,8 @@ export function splitInput(text) {
 // 三段以上視為手動輸入：單字 / 讀音 / 意思，剩下的全部當作例句
 export function parseManual(parts) {
   const [word, reading, meaning, ...rest] = parts;
-  return { word, reading, meaning, example: rest.join(' ') };
+  const level = jlptLevel(word, reading);
+  return { word, reading, meaning, tags: level ? [level] : [], example: rest.join(' ') };
 }
 
 export function userOf(interaction) {
@@ -39,7 +42,7 @@ const divider = () => ({ type: ComponentType.SEPARATOR, divider: true, spacing: 
 
 // 單字卡版面：單字放大當視覺焦點，讀音/等級/詞性同一行，意思與例句用分隔線分區
 export function buildCard(
-  { word, reading, meaning, english, tags = [], example, exampleTranslation },
+  { word, reading, meaning, english, tags = [], example, exampleTranslation, highlight },
   interaction,
   history,
 ) {
@@ -53,8 +56,9 @@ export function buildCard(
   ];
 
   if (example) {
-    // 例句中出現的單字加粗加底線，方便閱讀
-    const highlighted = example.replaceAll(word, `__**${word}**__`);
+    // 例句中出現的單字加粗加底線，方便閱讀（動詞變化時標示實際出現的形式）
+    const target = highlight || word;
+    const highlighted = example.replaceAll(target, `__**${target}**__`);
     components.push(
       divider(),
       text([highlighted, exampleTranslation && `-# ${exampleTranslation}`].filter(Boolean).join('\n')),

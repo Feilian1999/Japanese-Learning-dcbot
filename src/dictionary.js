@@ -1,28 +1,47 @@
+import { jlptLevel } from './jlpt.js';
+
 // 免費、不需要 API Key 的資料來源：
-// - Jisho（JMdict 字典）：讀音、英文解釋、詞性、JLPT 等級
+// - Jotoba（JMdict 字典）：讀音、詞性、英文解釋
+//   （原本用 Jisho，但從 Cloudflare Workers 連 Jisho 一律回 525，所以改用 Jotoba）
+// - JLPT 等級：內建對照表（src/jlpt-data.js，由 scripts/build-jlpt.js 產生）
 // - Cloudflare Workers AI：參考英文詞義整理繁體中文意思
 // - Google 翻譯（免費端點，失敗時改用 MyMemory）：例句翻譯，以及 AI 失敗時的中文意思
-// - Tatoeba（開放例句庫）：真人寫的日文例句
+// - 例句：Tatoeba（開放例句庫）→ Jotoba 例句 → Massif（網路文章），依序嘗試
 
-const POS_ZH = {
-  Noun: '名詞',
-  'Suru verb': 'する動詞',
-  'Godan verb': '五段動詞',
-  'Ichidan verb': '一段動詞',
-  'I-adjective': 'い形容詞',
-  'Na-adjective': 'な形容詞',
-  Adverb: '副詞',
-  Expressions: '慣用語',
-  Conjunction: '接續詞',
-  Interjection: '感嘆詞',
-  Particle: '助詞',
-  Counter: '量詞',
-};
+// Jotoba 的詞性格式：字串（"Adverb"）或物件（{ Verb: { Godan: "Ru" } }、{ Adjective: "Na" }）
+function posToZh(pos) {
+  const [kind, detail] = typeof pos === 'string' ? [pos, null] : Object.entries(pos)[0];
+  const sub = detail && typeof detail === 'object' ? Object.keys(detail)[0] : detail;
+  switch (kind) {
+    case 'Noun':
+      return '名詞';
+    case 'Pronoun':
+      return '代名詞';
+    case 'Adverb':
+    case 'AdverbTo':
+      return '副詞';
+    case 'Conjunction':
+      return '接續詞';
+    case 'Interjection':
+      return '感嘆詞';
+    case 'Particle':
+      return '助詞';
+    case 'Counter':
+      return '量詞';
+    case 'Adjective':
+      return { Keiyoushi: 'い形容詞', Na: 'な形容詞', No: 'の形容詞' }[sub] ?? '形容詞';
+    case 'Verb':
+      // Transitive / Intransitive（自他動詞）不顯示
+      return { Godan: '五段動詞', Ichidan: '一段動詞', Kuru: 'カ變動詞', Irregular: 'する動詞' }[sub] ?? null;
+    default:
+      return null;
+  }
+}
 
-async function getJson(url) {
+async function getJson(url, init = {}) {
   const res = await fetch(url, {
-    // Jisho 會擋 Node 預設的 User-Agent
-    headers: { 'User-Agent': 'discord-japanese-bot/1.0' },
+    ...init,
+    headers: { 'User-Agent': 'discord-japanese-bot/1.0', ...init.headers },
     signal: AbortSignal.timeout(10_000),
   });
   if (!res.ok) throw new Error(`${new URL(url).host} 回應 ${res.status}`);
@@ -48,60 +67,183 @@ async function translateMyMemory(text, from) {
   return data.responseData.translatedText;
 }
 
-async function translate(text, from = 'ja') {
-  try {
-    return await translateGoogle(text, from);
-  } catch {
-    return translateMyMemory(text, from);
-  }
+// Workers AI 翻譯，給機器翻譯失敗時備援
+async function translateAI(ai, text, from) {
+  const result = await ai.run(AI_MODEL, {
+    messages: [
+      {
+        role: 'system',
+        content: '你是專業翻譯，把文字翻成自然的繁體中文（台灣用語）。只輸出翻譯結果，不要任何說明。',
+      },
+      {
+        role: 'user',
+        content: `請把以下${from === 'zh-CN' ? '簡體中文' : '日文'}翻成繁體中文：\n${text} /no_think`,
+      },
+    ],
+    max_tokens: 200,
+  });
+  return aiText(result).split('\n')[0].trim();
 }
 
-async function lookupJisho(word) {
-  const data = await getJson(
-    `https://jisho.org/api/v1/search/words?keyword=${encodeURIComponent(word)}`,
-  );
+// 依序嘗試 Google → Workers AI → MyMemory，全部失敗回傳空字串
+// （從 Cloudflare 呼叫時 Google 偶爾會被限流；MyMemory 以網路位址計算額度，共用的 Cloudflare 位址常被用完）
+async function translate(text, from = 'ja', ai) {
+  const attempts = [
+    () => translateGoogle(text, from),
+    ai && (() => translateAI(ai, text, from)),
+    () => translateMyMemory(text, from),
+  ].filter(Boolean);
+  for (const attempt of attempts) {
+    try {
+      const result = await attempt();
+      if (result) return result;
+    } catch (err) {
+      console.error('翻譯失敗，改用下一個來源', err);
+    }
+  }
+  return '';
+}
+
+async function lookupDictionary(word) {
+  const data = await getJson('https://jotoba.de/api/search/words', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: word, language: 'English', no_english: false }),
+  });
   // 優先找寫法或讀音完全一致的條目
   const entry =
-    data.data.find((e) => e.japanese.some((j) => j.word === word || j.reading === word)) ??
-    data.data[0];
+    data.words.find((w) => w.reading.kanji === word || w.reading.kana === word) ?? data.words[0];
   if (!entry) return null;
 
-  const headword = entry.japanese.find((j) => j.word === word) ?? entry.japanese[0];
-  const sense = entry.senses[0];
-  const pos = sense.parts_of_speech
-    .map((p) => Object.entries(POS_ZH).find(([en]) => p.startsWith(en))?.[1])
-    .filter(Boolean);
+  const senses = entry.senses.slice(0, 5).map((s) => s.glosses.join('; '));
+  const pos = entry.senses[0].pos.map(posToZh).filter(Boolean);
   return {
-    word: headword.word ?? headword.reading,
-    reading: headword.reading,
-    english: sense.english_definitions.join('; '),
+    word: entry.reading.kanji ?? entry.reading.kana,
+    reading: entry.reading.kana,
+    english: senses[0],
     // 所有詞義的英文解釋，給 AI 整理中文意思用
-    senses: entry.senses
-      .filter((s) => !s.parts_of_speech.includes('Wikipedia definition'))
-      .slice(0, 5)
-      .map((s) => s.english_definitions.join('; ')),
+    senses,
     partOfSpeech: [...new Set(pos)].join('・'),
-    jlpt: entry.jlpt[0]?.replace('jlpt-', '').toUpperCase() ?? '',
   };
 }
 
-async function findExample(word) {
-  const base =
-    'https://api.tatoeba.org/unstable/sentences?lang=jpn&sort=relevance&limit=10' +
-    `&q=${encodeURIComponent(word)}`;
-  // 先找有中文翻譯的例句，沒有的話退而求其次找任何例句
-  for (const url of [`${base}&trans:lang=cmn`, base]) {
-    const { data } = await getJson(url);
-    // 偏好長度適中的句子
-    const sentence = data
-      .filter((s) => s.text.includes(word))
+// 各例句來源回傳候選句：
+// { text, zh?（真人中文翻譯）, en?（真人英文翻譯）, highlight?（句中實際出現的單字形式）}
+async function fromTatoeba(word, withChinese) {
+  // showtrans=all 才會附上所有語言的翻譯（預設只附篩選條件的語言，或完全不附）
+  const url =
+    'https://api.tatoeba.org/unstable/sentences?lang=jpn&sort=relevance&limit=10&showtrans=all' +
+    `&q=${encodeURIComponent(word)}${withChinese ? '&trans:lang=cmn' : ''}`;
+  const { data } = await getJson(url);
+  return data
+    .filter((s) => s.text.includes(word))
+    .map((s) => ({
+      text: s.text,
+      zh: s.translations?.find((t) => t.lang === 'cmn'),
+      en: s.translations?.find((t) => t.lang === 'eng')?.text,
+    }));
+}
+
+// Jotoba 例句：資料同樣來自 Tatoeba，但會比對動詞變化（堪える → 堪えた）
+async function fromJotoba(word) {
+  const { sentences } = await getJson('https://jotoba.de/api/search/sentences', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: word, language: 'English' }),
+  });
+  return sentences.map((s) => ({ text: s.content, en: s.translation }));
+}
+
+// Massif：從網路文章收集的例句，收錄範圍最廣（新詞、冷門詞也找得到）
+async function fromMassif(word) {
+  const { results } = await getJson(
+    `https://massif.la/ja/search?q=${encodeURIComponent(word)}&fmt=json`,
+  );
+  return results.map((r) => ({
+    text: r.text,
+    highlight: r.highlighted_html.match(/<em>(.+?)<\/em>/)?.[1],
+  }));
+}
+
+// 句中實際出現的單字形式：取單字最長的開頭部分（堪える 在「堪えた」中是「堪え」）
+function matchedForm(text, word) {
+  for (let n = word.length; n > 0; n--) {
+    const part = word.slice(0, n);
+    // 只剩一個假名時太容易誤標，至少要兩個字或含漢字
+    if (text.includes(part) && (n >= 2 || /[\u4e00-\u9fff]/.test(part))) return part;
+  }
+  return '';
+}
+
+// AI 翻譯例句，附上真人翻譯當參考，避免誤解句意（例如把「上級国民」誤翻成「老年人」）
+async function translateSentenceAI(ai, { text, en, zh }) {
+  const references = [
+    en && `英文參考翻譯（真人翻譯）：${en}`,
+    zh && `簡體中文參考翻譯（真人翻譯）：${zh.text}`,
+  ].filter(Boolean);
+  const result = await ai.run(AI_MODEL, {
+    messages: [
+      {
+        role: 'system',
+        content: '你是專業日文翻譯，把日文翻成自然的繁體中文（台灣用語）。只輸出翻譯結果，不要任何說明。',
+      },
+      {
+        role: 'user',
+        content:
+          `日文：${text}\n${references.join('\n')}\n\n` +
+          '請把日文翻成繁體中文。以日文原文為準，參考翻譯只用來確認意思。/no_think',
+      },
+    ],
+    max_tokens: 200,
+  });
+  const translation = aiText(result).split('\n')[0].trim();
+  // 回傳內容不像翻譯（沒有漢字、或長得不合理）就視為失敗
+  if (!/[\u4e00-\u9fff]/.test(translation) || translation.length > text.length * 3 + 20) {
+    throw new Error(`AI 翻譯格式不符：${translation.slice(0, 50)}`);
+  }
+  return translation;
+}
+
+// 例句翻譯：真人繁中翻譯 → AI（參考真人翻譯）→ 機器翻譯
+async function translateSentence(ai, sentence) {
+  const { text, zh } = sentence;
+  if (zh?.script === 'Hant') return zh.text;
+  if (ai) {
+    try {
+      return await translateSentenceAI(ai, sentence);
+    } catch (err) {
+      console.error('AI 翻譯例句失敗，改用機器翻譯', err);
+    }
+  }
+  // 有簡體翻譯就轉成繁體，否則直接翻日文
+  return zh ? translate(zh.text, 'zh-CN') : translate(text, 'ja');
+}
+
+// 依序嘗試各來源，前一個找不到才換下一個；單一來源出錯不影響後面的
+const EXAMPLE_SOURCES = [
+  (word) => fromTatoeba(word, true),
+  (word) => fromTatoeba(word, false),
+  fromJotoba,
+  fromMassif,
+];
+
+async function findExample(word, ai) {
+  for (const source of EXAMPLE_SOURCES) {
+    const candidates = await source(word).catch((err) => {
+      console.error('例句來源失敗', err);
+      return [];
+    });
+    // 偏好長度適中的句子（太短沒有上下文，太長不好讀）
+    const sentence = candidates
+      .filter((c) => c.text.length >= 6 && c.text.length <= 40)
       .sort((a, b) => Math.abs(a.text.length - 20) - Math.abs(b.text.length - 20))[0];
     if (!sentence) continue;
 
-    const zh = sentence.translations?.find((t) => t.lang === 'cmn');
-    // 繁體直接用；簡體或沒有中文翻譯就翻成繁中
-    const translation = zh?.script === 'Hant' ? zh.text : await translate(zh?.text ?? sentence.text, zh ? 'zh-CN' : 'ja');
-    return { example: sentence.text, exampleTranslation: translation };
+    return {
+      example: sentence.text,
+      exampleTranslation: await translateSentence(ai, sentence),
+      highlight: sentence.highlight || matchedForm(sentence.text, word),
+    };
   }
   return { example: '', exampleTranslation: '' };
 }
@@ -109,6 +251,12 @@ async function findExample(word) {
 // Cloudflare Workers AI（免費每天 10,000 Neurons，一次約 5 Neurons）
 // 參考字典所有英文詞義，整理成繁體中文意思；比直接機器翻譯單字更能涵蓋多種意思
 const AI_MODEL = '@cf/qwen/qwen3-30b-a3b-fp8';
+
+// 不同模型的回傳格式不同：{ response } 或 OpenAI 格式 { choices }；並去掉思考過程
+function aiText(result) {
+  const raw = result.response ?? result.choices?.[0]?.message?.content ?? '';
+  return raw.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+}
 
 async function meaningFromAI(ai, word, reading, senses) {
   const definitions = senses.map((s, i) => `${i + 1}. ${s}`).join('\n');
@@ -131,11 +279,8 @@ async function meaningFromAI(ai, word, reading, senses) {
     max_tokens: 100,
   });
 
-  // 不同模型的回傳格式不同：{ response } 或 OpenAI 格式 { choices }
-  const raw = result.response ?? result.choices?.[0]?.message?.content ?? '';
+  const raw = aiText(result);
   const items = raw
-    .replace(/<think>[\s\S]*?<\/think>/g, '')
-    .trim()
     .split('\n')[0]
     .split(/[;；、,，]/)
     .map((m) => m.replace(/[「」"'。\s]/g, ''))
@@ -150,33 +295,40 @@ async function meaningFromAI(ai, word, reading, senses) {
 }
 
 // 有 AI 且字典有英文詞義時用 AI 整理，否則（或失敗時）直接機器翻譯單字
-async function findMeaning(ai, word, jisho) {
-  if (ai && jisho?.senses.length) {
+async function findMeaning(ai, word, dict) {
+  if (ai && dict?.senses.length) {
     try {
-      return await meaningFromAI(ai, word, jisho.reading, jisho.senses);
+      return await meaningFromAI(ai, word, dict.reading, dict.senses);
     } catch (err) {
       console.error('AI 釋義失敗，改用機器翻譯', err);
     }
   }
-  return translate(word);
+  return translate(word, 'ja', ai);
 }
 
 // 只給單字（或單字＋讀音）時，查字典補齊其餘欄位
 export async function generateEntry(input, reading, ai) {
-  const jisho = await lookupJisho(input).catch(() => null);
+  const dict = await lookupDictionary(input).catch((err) => {
+    console.error('查字典失敗', err);
+    return null;
+  });
   // 輸入平假名（例如 たべる）時改用字典的漢字寫法（食べる）去翻譯和找例句
-  const word = jisho?.word ?? input;
+  const word = dict?.word ?? input;
   const [meaning, example] = await Promise.all([
-    findMeaning(ai, word, jisho),
-    findExample(word).catch(() => ({ example: '', exampleTranslation: '' })),
+    findMeaning(ai, word, dict),
+    findExample(word, ai).catch((err) => {
+      console.error('找例句失敗', err);
+      return { example: '', exampleTranslation: '' };
+    }),
   ]);
 
+  const finalReading = reading || dict?.reading || word;
   return {
     word,
-    reading: reading || jisho?.reading || word,
+    reading: finalReading,
     meaning,
-    english: jisho?.english ?? '',
-    tags: [jisho?.jlpt, jisho?.partOfSpeech].filter(Boolean),
+    english: dict?.english ?? '',
+    tags: [jlptLevel(word, finalReading), dict?.partOfSpeech].filter(Boolean),
     ...example,
   };
 }
