@@ -1,0 +1,18 @@
+{
+  "name": "discord-japanese-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "register": "node --env-file=.env scripts/register.js",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "devDependencies": {
+    "wrangler": "^4.151.0"
+  }
+}
