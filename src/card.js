@@ -5,6 +5,14 @@ export function splitInput(text) {
   return text.trim().split(/[\s　]+/).filter(Boolean);
 }
 
+const isKana = (text) => /^[\u3040-\u30ffー]+$/.test(text);
+
+// 一～兩段：自動查詢。第二段全是假名才當讀音（ひかえしつ），否則當意思（月村手毬）
+export function parseAuto([word, second]) {
+  if (!second) return { word, hint: {} };
+  return { word, hint: isKana(second) ? { reading: second } : { meaning: second } };
+}
+
 // 三段以上視為手動輸入：單字 / 讀音 / 意思，剩下的全部當作例句
 export function parseManual(parts) {
   const [word, reading, meaning, ...rest] = parts;
@@ -42,17 +50,26 @@ const divider = () => ({ type: ComponentType.SEPARATOR, divider: true, spacing: 
 
 // 單字卡版面：單字放大當視覺焦點，讀音/等級/詞性同一行，意思與例句用分隔線分區
 export function buildCard(
-  { word, reading, meaning, english, tags = [], example, exampleTranslation, highlight },
+  { word, reading, meaning, meaningNote, english, tags = [], example, exampleTranslation, highlight },
   interaction,
   history,
 ) {
   // 等級、詞性用行內程式碼顯示成小標籤
-  const infoLine = [reading, ...tags.map((tag) => `\`${tag}\``)].join('　');
+  // 讀音跟單字一樣（假名寫的字）就不重複顯示
+  const infoLine = [reading !== word && reading, ...tags.map((tag) => `\`${tag}\``)]
+    .filter(Boolean)
+    .join('　');
 
   const components = [
-    text(`# ${word}\n${infoLine}`),
+    text([`# ${word}`, infoLine].filter(Boolean).join('\n')),
     divider(),
-    text([`**${meaning || '（查無翻譯）'}**`, english && `-# ${english}`].filter(Boolean).join('\n')),
+    text(
+      meaning
+        ? [`**${meaning}**`, english && `-# ${english}`, meaningNote && `-# ${meaningNote}`]
+            .filter(Boolean)
+            .join('\n')
+        : meaningNote || '（查無翻譯）',
+    ),
   ];
 
   if (example) {

@@ -5,6 +5,7 @@ import { jlptLevel } from './jlpt.js';
 //   （原本用 Jisho，但從 Cloudflare Workers 連 Jisho 一律回 525，所以改用 Jotoba）
 // - JLPT 等級：內建對照表（src/jlpt-data.js，由 scripts/build-jlpt.js 產生）
 // - Cloudflare Workers AI：參考英文詞義整理繁體中文意思
+// - 日文維基百科：字典沒收錄的字（人名、作品名、新詞），交給 AI 依條目解釋
 // - Google 翻譯（免費端點，失敗時改用 MyMemory）：例句翻譯，以及 AI 失敗時的中文意思
 // - 例句：Tatoeba（開放例句庫）→ Jotoba 例句 → Massif（網路文章），依序嘗試
 
@@ -110,9 +111,9 @@ async function lookupDictionary(word) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query: word, language: 'English', no_english: false }),
   });
-  // 優先找寫法或讀音完全一致的條目
-  const entry =
-    data.words.find((w) => w.reading.kanji === word || w.reading.kana === word) ?? data.words[0];
+  // 只接受寫法或讀音完全一致的條目；字典沒收錄的字（例如人名、暱稱），
+  // Jotoba 會回傳部分相符的結果（てまぬい → て），不能拿來用
+  const entry = data.words.find((w) => w.reading.kanji === word || w.reading.kana === word);
   if (!entry) return null;
 
   const senses = entry.senses.slice(0, 5).map((s) => s.glosses.join('; '));
@@ -219,6 +220,13 @@ async function translateSentence(ai, sentence) {
   return zh ? translate(zh.text, 'zh-CN') : translate(text, 'ja');
 }
 
+// 句子裡要真的有這個字：完整出現，或只差詞尾的變化（堪える → 堪えた）
+// 搜尋結果是模糊比對，不檢查會配到無關的句子（てまぬい → 手間がはぶけます）
+function containsWord(candidate, word) {
+  if (candidate.highlight) return true;
+  return matchedForm(candidate.text, word).length >= Math.max(1, word.length - 2);
+}
+
 // 依序嘗試各來源，前一個找不到才換下一個；單一來源出錯不影響後面的
 const EXAMPLE_SOURCES = [
   (word) => fromTatoeba(word, true),
@@ -236,6 +244,7 @@ async function findExample(word, ai) {
     // 偏好長度適中的句子（太短沒有上下文，太長不好讀）
     const sentence = candidates
       .filter((c) => c.text.length >= 6 && c.text.length <= 40)
+      .filter((c) => containsWord(c, word))
       .sort((a, b) => Math.abs(a.text.length - 20) - Math.abs(b.text.length - 20))[0];
     if (!sentence) continue;
 
@@ -295,38 +304,109 @@ async function meaningFromAI(ai, word, reading, senses) {
 }
 
 // 有 AI 且字典有英文詞義時用 AI 整理，否則（或失敗時）直接機器翻譯單字
+// 字典沒收錄的字（人名、作品名、新詞）改查日文維基百科
+// 用完全相同的標題查（會跟著重新導向，例如 月村手毬 → 学園アイドルマスター），不用模糊搜尋，避免配到無關條目
+async function lookupWikipedia(word) {
+  const res = await fetch(
+    `https://ja.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(word)}`,
+    {
+      // 維基百科要求 User-Agent 附上聯絡方式
+      headers: { 'User-Agent': 'discord-japanese-bot/1.0 (https://github.com/Feilian1999/Japanese-Learning-dcbot)' },
+      signal: AbortSignal.timeout(10_000),
+    },
+  );
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`ja.wikipedia.org 回應 ${res.status}`);
+  const page = await res.json();
+  // 消歧義頁等非一般條目不採用
+  if (page.type !== 'standard' || !page.extract) return null;
+  return { title: page.title, extract: page.extract.slice(0, 500) };
+}
+
+// 維基摘要開頭通常寫著讀音：蛙化現象（かえるかげんしょう）とは…
+function readingFromExtract(word, { title, extract }) {
+  if (title !== word || !extract.startsWith(word)) return '';
+  return extract.slice(word.length).match(/^（([\u3040-\u309fー・\s]+)[）、]/)?.[1].replace(/[・\s]/g, '') ?? '';
+}
+
+async function meaningFromWikipedia(ai, word, { title, extract }) {
+  const redirect = title !== word ? `（「${word}」會重新導向到這個條目）` : '';
+  const result = await ai.run(AI_MODEL, {
+    messages: [
+      { role: 'system', content: '你是日文老師，根據提供的資料替台灣學習者解釋日文詞語。' },
+      {
+        role: 'user',
+        content:
+          `詞語：${word}\n維基百科條目「${title}」${redirect}的摘要：\n${extract}\n\n` +
+          `請根據以上資料，用繁體中文寫出「${word}」的簡短解釋（一句話，30 字以內）。` +
+          '只根據資料內容，不要補充資料以外的事。只輸出解釋本身。/no_think',
+      },
+    ],
+    max_tokens: 150,
+  });
+  const meaning = aiText(result).split('\n')[0].trim();
+  if (!/[\u4e00-\u9fff]/.test(meaning) || meaning.length > 80) {
+    throw new Error(`AI 解釋格式不符：${meaning.slice(0, 50)}`);
+  }
+  return meaning;
+}
+
+const NOT_FOUND = { meaning: '', note: '字典查無此字，可用 `/add 單字 意思` 自己補上' };
+
+// 字典查不到時：有維基條目就請 AI 依條目解釋；查不到就明白標示，不讓 AI 亂猜
+async function explainFromWikipedia(ai, word) {
+  if (!ai) return NOT_FOUND;
+  try {
+    const page = await lookupWikipedia(word);
+    if (!page) return NOT_FOUND;
+    return {
+      meaning: await meaningFromWikipedia(ai, word, page),
+      note: `📚 參考維基百科「${page.title}」`,
+      reading: readingFromExtract(word, page),
+    };
+  } catch (err) {
+    console.error('維基百科解釋失敗', err);
+    return NOT_FOUND;
+  }
+}
+
+// 回傳 { meaning, note?, reading? }
 async function findMeaning(ai, word, dict) {
-  if (ai && dict?.senses.length) {
+  if (!dict) return explainFromWikipedia(ai, word);
+  if (ai && dict.senses.length) {
     try {
-      return await meaningFromAI(ai, word, dict.reading, dict.senses);
+      return { meaning: await meaningFromAI(ai, word, dict.reading, dict.senses) };
     } catch (err) {
       console.error('AI 釋義失敗，改用機器翻譯', err);
     }
   }
-  return translate(word, 'ja', ai);
+  return { meaning: await translate(word, 'ja', ai) };
 }
 
 // 只給單字（或單字＋讀音）時，查字典補齊其餘欄位
-export async function generateEntry(input, reading, ai) {
+// hint：使用者自己提供的讀音或意思，有給就不自動產生
+export async function generateEntry(input, hint, ai) {
+  const { reading, meaning: givenMeaning } = hint;
   const dict = await lookupDictionary(input).catch((err) => {
     console.error('查字典失敗', err);
     return null;
   });
   // 輸入平假名（例如 たべる）時改用字典的漢字寫法（食べる）去翻譯和找例句
   const word = dict?.word ?? input;
-  const [meaning, example] = await Promise.all([
-    findMeaning(ai, word, dict),
+  const [meaningInfo, example] = await Promise.all([
+    givenMeaning ? { meaning: givenMeaning } : findMeaning(ai, word, dict),
     findExample(word, ai).catch((err) => {
       console.error('找例句失敗', err);
       return { example: '', exampleTranslation: '' };
     }),
   ]);
 
-  const finalReading = reading || dict?.reading || word;
+  const finalReading = reading || dict?.reading || meaningInfo.reading || word;
   return {
     word,
     reading: finalReading,
-    meaning,
+    meaning: meaningInfo.meaning,
+    meaningNote: meaningInfo.note,
     english: dict?.english ?? '',
     tags: [jlptLevel(word, finalReading), dict?.partOfSpeech].filter(Boolean),
     ...example,

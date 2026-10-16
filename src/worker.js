@@ -1,4 +1,4 @@
-import { buildCard, parseManual, splitInput } from './card.js';
+import { buildCard, parseAuto, parseManual, splitInput } from './card.js';
 import { generateEntry } from './dictionary.js';
 import { recordEntry } from './history.js';
 
@@ -47,7 +47,8 @@ function editOriginal(env, interaction, payload) {
 
 async function generateAndReply(env, interaction, parts) {
   try {
-    const entry = await generateEntry(parts[0], parts[1], env.AI);
+    const { word, hint } = parseAuto(parts);
+    const entry = await generateEntry(word, hint, env.AI);
     const history = await recordEntry(env, interaction, entry);
     await editOriginal(env, interaction, buildCard(entry, interaction, history));
   } catch (err) {

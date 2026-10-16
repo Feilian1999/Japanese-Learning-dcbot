@@ -9,7 +9,8 @@
 | 輸入 | 結果 |
 |---|---|
 | `/add 控え室` | 自動查出讀音、意思、例句 |
-| `/add 控え室 ひかえしつ` | 讀音用你給的，其餘自動查 |
+| `/add 控え室 ひかえしつ` | 第二段是假名 → 當讀音，其餘自動查 |
+| `/add てまぬい 月村手毬` | 第二段不是假名 → 當意思，其餘自動查（適合人名、暱稱等字典沒收錄的字） |
 | `/add 控え室 ひかえしつ 休息室 控え室で待ってください。` | 完全照你輸入的內容發卡片 |
 
 - 各段之間用半形或全形空白分隔
@@ -40,6 +41,7 @@
 | 欄位 | 來源 |
 |---|---|
 | 讀音、詞性、英文解釋 | [Jotoba](https://jotoba.de)（JMdict 字典） |
+| 字典沒收錄的字 | 以完全相同的標題查[日文維基百科](https://ja.wikipedia.org)（含重新導向），由 Workers AI 依條目摘要解釋，卡片標示「📚 參考維基百科」；查不到則顯示「字典查無此字」，不讓 AI 猜測 |
 | JLPT 等級 | 內建對照表，來自 [open-anki-jlpt-decks](https://github.com/jamsinclair/open-anki-jlpt-decks)（MIT），原始資料為 [Jonathan Waller 的 JLPT 單字表](https://www.tanos.co.uk/jlpt/)，N5～N1 約 8000 字 |
 | 中文意思 | [Cloudflare Workers AI](https://developers.cloudflare.com/workers-ai/)（Qwen3）參考字典的英文詞義整理；失敗時改用 Google 翻譯 / [MyMemory](https://mymemory.translated.net) |
 | 例句 | 依序嘗試：[Tatoeba](https://tatoeba.org) 開放例句庫 → [Jotoba](https://jotoba.de) 例句（可找到動詞變化）→ [Massif](https://massif.la)（網路文章例句，收錄最廣） |
@@ -55,7 +57,7 @@ Workers AI 免費額度每天 10,000 Neurons，查一個字（中文意思＋例
 你在 Discord 輸入 /add
       ↓
 Discord ──呼叫──▶ Cloudflare Worker（workers.dev 網址）
-                     ├─▶ Jotoba（字典）
+                     ├─▶ Jotoba（字典）／ 日文維基百科（字典沒收錄的字）
                      ├─▶ Workers AI（中文意思）
                      ├─▶ Tatoeba / Jotoba / Massif（例句）
                      ├─▶ Google 翻譯（例句翻譯）
