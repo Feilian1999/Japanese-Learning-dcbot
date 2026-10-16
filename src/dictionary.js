@@ -305,13 +305,16 @@ async function meaningFromAI(ai, word, reading, senses) {
 
 // 有 AI 且字典有英文詞義時用 AI 整理，否則（或失敗時）直接機器翻譯單字
 // 字典沒收錄的字（人名、作品名、新詞）改查日文維基百科
+// 維基百科要求 User-Agent 附上聯絡方式
+const WIKIPEDIA_USER_AGENT =
+  'discord-japanese-bot/1.0 (https://github.com/Feilian1999/Japanese-Learning-dcbot)';
+
 // 用完全相同的標題查（會跟著重新導向，例如 月村手毬 → 学園アイドルマスター），不用模糊搜尋，避免配到無關條目
 async function lookupWikipedia(word) {
   const res = await fetch(
     `https://ja.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(word)}`,
     {
-      // 維基百科要求 User-Agent 附上聯絡方式
-      headers: { 'User-Agent': 'discord-japanese-bot/1.0 (https://github.com/Feilian1999/Japanese-Learning-dcbot)' },
+      headers: { 'User-Agent': WIKIPEDIA_USER_AGENT },
       signal: AbortSignal.timeout(10_000),
     },
   );
@@ -323,10 +326,30 @@ async function lookupWikipedia(word) {
   return { title: page.title, extract: page.extract.slice(0, 500) };
 }
 
-// 維基摘要開頭通常寫著讀音：蛙化現象（かえるかげんしょう）とは…
-function readingFromExtract(word, { title, extract }) {
-  if (title !== word || !extract.startsWith(word)) return '';
-  return extract.slice(word.length).match(/^（([\u3040-\u309fー・\s]+)[）、]/)?.[1].replace(/[・\s]/g, '') ?? '';
+// 讀音要從維基原始碼找：摘要會省略括號裡的讀音（『学園アイドルマスター』 は…），
+// 重新導向時摘要也是目標條目的內容（月村手毬 → 学園アイドルマスター），找不到這個字的讀音
+async function readingFromWikipedia(word) {
+  const { parse } = await getJson(
+    'https://ja.wikipedia.org/w/api.php?action=parse&format=json&formatversion=2&prop=wikitext&redirects=1' +
+      `&page=${encodeURIComponent(word)}`,
+    { headers: { 'User-Agent': WIKIPEDIA_USER_AGENT } },
+  );
+  const wikitext = parse?.wikitext ?? '';
+  // 原始碼裡的寫法可能在姓名中間加空白（月村 手毬）
+  const name = [...word].map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s*');
+  const kana = '[\\u3040-\\u30ffー・\\s]+';
+  const patterns = [
+    // {{読み仮名|月村 手毬|つきむら てまり}}
+    new RegExp(`\\{\\{読み仮名(?:_ruby不使用)?\\|${name}\\|(${kana})[|}]`),
+    // '''推し活'''（おしかつ）、『'''学園アイドルマスター'''』（がくえんアイドルマスター、…）
+    new RegExp(`'''${name}'''[』」]?\\s*（(${kana})[）、]`),
+  ];
+  for (const pattern of patterns) {
+    const reading = wikitext.match(pattern)?.[1].replace(/[・\s]/g, '');
+    // 至少要有平假名，避免把純片假名的別名當成讀音
+    if (reading && /[぀-ゟ]/.test(reading)) return reading;
+  }
+  return '';
 }
 
 async function meaningFromWikipedia(ai, word, { title, extract }) {
@@ -359,11 +382,15 @@ async function explainFromWikipedia(ai, word) {
   try {
     const page = await lookupWikipedia(word);
     if (!page) return NOT_FOUND;
-    return {
-      meaning: await meaningFromWikipedia(ai, word, page),
-      note: `📚 參考維基百科「${page.title}」`,
-      reading: readingFromExtract(word, page),
-    };
+    const [meaning, reading] = await Promise.all([
+      meaningFromWikipedia(ai, word, page),
+      // 讀音找不到不影響解釋
+      readingFromWikipedia(word).catch((err) => {
+        console.error('維基百科讀音失敗', err);
+        return '';
+      }),
+    ]);
+    return { meaning, note: `📚 參考維基百科「${page.title}」`, reading };
   } catch (err) {
     console.error('維基百科解釋失敗', err);
     return NOT_FOUND;
